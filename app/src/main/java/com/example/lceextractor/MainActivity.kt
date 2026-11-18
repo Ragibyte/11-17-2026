@@ -188,35 +188,46 @@ class MainActivity : Activity() {
             }
         }
         val endians = when (mode) { 1 -> listOf("big"); 2 -> listOf("little"); else -> listOf("big", "little") }
-        val candidates = endians.mapNotNull { endian ->
-            if (data.size < 8) return@mapNotNull null
-            val offset = u32(data, 0, endian)
-            val count = u32(data, 4, endian)
-            if (offset >= 8 && offset <= data.size.toLong() && count in 1..100000L &&
-                count <= (data.size.toLong() - offset) / 144L) IndexCandidate(endian, offset, count)
-            else null
+        if (data.size < 8) throw IllegalArgumentException("File is too small to contain the 8-byte save header.")
+        var chosenEndian: String? = null
+        var indexOffset = -1L
+        var headerFileCount = 0L
+        for (candidateEndian in endians) {
+            val candidateOffset = u32(data, 0, candidateEndian)
+            val candidateCount = u32(data, 4, candidateEndian)
+            if (candidateOffset >= 8 && candidateOffset <= data.size.toLong() - 144L) {
+                chosenEndian = candidateEndian
+                indexOffset = candidateOffset
+                headerFileCount = candidateCount
+                break
+            }
         }
-        val chosen = candidates.firstOrNull()
-            ?: throw IllegalArgumentException("Could not find a valid index. Check the file and endianness; this edition/version may not be supported.")
+        val endian = chosenEndian ?: run {
+            val preview = data.take(16).joinToString(" ") { "%02X".format(it) }
+            val bigOffset = u32(data, 0, "big")
+            val littleOffset = u32(data, 0, "little")
+            throw IllegalArgumentException("Header did not contain a plausible index offset. Size: ${data.size} bytes; first 16 bytes: $preview; big-endian offset: $bigOffset; little-endian offset: $littleOffset. This may be the wrong save file, a container, or an unsupported edition/version.")
+        }
         val result = ArrayList<ExtractedFile>()
-        var cursor = chosen.offset.toInt()
-        repeat(chosen.count.toInt()) {
-            if (cursor > data.size - 144) throw IllegalArgumentException("Index entry extends beyond the save file.")
-            val nameBytes = data.copyOfRange(cursor, cursor + 80)
-            val rawName = String(nameBytes, Charsets.US_ASCII).substringBefore('\u0000').trim()
-            val length = u32(data, cursor + 128, chosen.endian)
-            val offset = u32(data, cursor + 132, chosen.endian)
+        var cursor = indexOffset.toInt()
+        var recordsRead = 0
+        // Match the supplied Python extractor: it reports the header count but reads 144-byte records to EOF.
+        while (cursor <= data.size - 144) {
+            val rawName = String(data, cursor, 80, Charsets.US_ASCII).substringBefore('\\u0000').trim()
+            val length = u32(data, cursor + 128, endian)
+            val fileOffset = u32(data, cursor + 132, endian)
             cursor += 144
-            if (rawName.isEmpty()) return@repeat
-            if (length > Int.MAX_VALUE || offset > data.size.toLong() || length > data.size.toLong() - offset) {
-                throw IllegalArgumentException("Invalid file bounds in index entry: $rawName")
+            recordsRead++
+            if (rawName.isEmpty()) continue
+            if (length > Int.MAX_VALUE || fileOffset > data.size.toLong() || length > data.size.toLong() - fileOffset) {
+                throw IllegalArgumentException("Invalid file bounds for '$rawName' (length=$length, offset=$fileOffset, save size=${data.size}).")
             }
             val safeName = safeEntryName(rawName)
             if (safeName.isNotEmpty()) {
-                result.add(ExtractedFile(safeName, data.copyOfRange(offset.toInt(), (offset + length).toInt())))
+                result.add(ExtractedFile(safeName, data.copyOfRange(fileOffset.toInt(), (fileOffset + length).toInt())))
             }
         }
-        if (result.isEmpty()) throw IllegalArgumentException("The index contained no extractable files.")
+        if (result.isEmpty()) throw IllegalArgumentException("Index offset $indexOffset ($endian-endian) was plausible, but no named files were extracted. Header file-count field: $headerFileCount; 144-byte records scanned: $recordsRead.")
         return result
     }
 
