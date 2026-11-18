@@ -180,6 +180,43 @@ class MainActivity : Activity() {
         if (head.contains("789c")) {
             if (data.size <= 8) throw IllegalArgumentException("Compressed save is too short.")
             data = InflaterInputStream(ByteArrayInputStream(data, 8, data.size - 8)).use { it.readBytes() }
+        } else if (data.size > 10 && u32(data, 0, "big") == 0L && u32(data, 0, "little") == 0L) {
+            // PS Vita LCE wraps the container in an 8-byte header followed by its own zero-run RLE stream.
+            val vitaEndians = when (mode) { 1 -> listOf("big"); 2 -> listOf("little"); else -> listOf("big", "little") }
+            var vitaDecoded: ByteArray? = null
+            val failures = ArrayList<String>()
+            for (vitaEndian in vitaEndians) {
+                val expectedSize = u32(data, 4, vitaEndian)
+                if (expectedSize <= 0L || expectedSize > 536870912L) {
+                    failures.add("$vitaEndian header size=$expectedSize is implausible")
+                    continue
+                }
+                try {
+                    val out = ByteArrayOutputStream(expectedSize.toInt())
+                    var input = 8
+                    while (input < data.size) {
+                        val value = data[input].toInt() and 0xff
+                        input++
+                        if (value != 0) {
+                            out.write(value)
+                        } else {
+                            if (input >= data.size) throw IllegalArgumentException("RLE stream ends after a zero marker")
+                            val zeroCount = data[input].toInt() and 0xff
+                            input++
+                            repeat(zeroCount) { out.write(0) }
+                        }
+                        if (out.size() > expectedSize) throw IllegalArgumentException("RLE output exceeded declared size $expectedSize")
+                    }
+                    if (out.size().toLong() != expectedSize) {
+                        throw IllegalArgumentException("RLE output was ${out.size()} bytes; header declared $expectedSize")
+                    }
+                    vitaDecoded = out.toByteArray()
+                    break
+                } catch (e: Exception) {
+                    failures.add("$vitaEndian: ${e.message}")
+                }
+            }
+            data = vitaDecoded ?: throw IllegalArgumentException("Detected a PS Vita-style 8-byte save header, but Vita RLE decompression failed: ${failures.joinToString("; ")}")
         }
         if (data.size >= 3) {
             val header = String(data, 0, 3, Charsets.US_ASCII)
@@ -213,7 +250,7 @@ class MainActivity : Activity() {
         var recordsRead = 0
         // Match the supplied Python extractor: it reports the header count but reads 144-byte records to EOF.
         while (cursor <= data.size - 144) {
-            val rawName = String(data, cursor, 80, Charsets.US_ASCII).substringBefore('\\u0000').trim()
+            val rawName = String(data, cursor, 80, Charsets.US_ASCII).replace(0.toChar().toString(), "").trim()
             val length = u32(data, cursor + 128, endian)
             val fileOffset = u32(data, cursor + 132, endian)
             cursor += 144
