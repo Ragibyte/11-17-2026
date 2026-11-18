@@ -72,7 +72,7 @@ class MainActivity : Activity() {
         })
         endianSpinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("Auto-detect", "Big-endian (PS3 / Wii U / Xbox 360)", "Little-endian (Switch)"))
+                listOf("Auto-detect", "Big-endian (PS3 / Wii U / Xbox 360)", "Little-endian (Switch)", "PS Vita (decrypted game data only)"))
         }
         content.addView(endianSpinner, fullWidth())
 
@@ -179,46 +179,14 @@ class MainActivity : Activity() {
     private fun extract(dataOriginal: ByteArray, mode: Int): List<ExtractedFile> {
         var data = dataOriginal
         val head = data.take(16).joinToString("") { "%02x".format(it) }
-        if (head.contains("789c")) {
+        if (mode == 3) {
+            // The Vita game source decompresses the payload in place after the 8-byte save header.
+            // This is separate from the encrypted PS Vita save-container/PFS layer.
+            if (data.size <= 8) throw IllegalArgumentException("PS Vita save is too short to contain its 8-byte header and RLE payload.")
+            data = decodeVitaPayload(data)
+        } else if (head.contains("789c")) {
             if (data.size <= 8) throw IllegalArgumentException("Compressed save is too short.")
             data = InflaterInputStream(ByteArrayInputStream(data, 8, data.size - 8)).use { it.readBytes() }
-        } else if (data.size > 10 && u32(data, 0, "big") == 0L && u32(data, 0, "little") == 0L) {
-            // PS Vita LCE wraps the container in an 8-byte header followed by its own zero-run RLE stream.
-            val vitaEndians = when (mode) { 1 -> listOf("big"); 2 -> listOf("little"); else -> listOf("big", "little") }
-            var vitaDecoded: ByteArray? = null
-            val failures = ArrayList<String>()
-            for (vitaEndian in vitaEndians) {
-                val expectedSize = u32(data, 4, vitaEndian)
-                if (expectedSize <= 0L || expectedSize > 536870912L) {
-                    failures.add("$vitaEndian header size=$expectedSize is implausible")
-                    continue
-                }
-                try {
-                    val out = ByteArrayOutputStream(expectedSize.toInt())
-                    var input = 8
-                    while (input < data.size) {
-                        val value = data[input].toInt() and 0xff
-                        input++
-                        if (value != 0) {
-                            out.write(value)
-                        } else {
-                            if (input >= data.size) throw IllegalArgumentException("RLE stream ends after a zero marker")
-                            val zeroCount = data[input].toInt() and 0xff
-                            input++
-                            repeat(zeroCount) { out.write(0) }
-                        }
-                        if (out.size() > expectedSize) throw IllegalArgumentException("RLE output exceeded declared size $expectedSize")
-                    }
-                    if (out.size().toLong() != expectedSize) {
-                        throw IllegalArgumentException("RLE output was ${out.size()} bytes; header declared $expectedSize")
-                    }
-                    vitaDecoded = out.toByteArray()
-                    break
-                } catch (e: Exception) {
-                    failures.add("$vitaEndian: ${e.message}")
-                }
-            }
-            data = vitaDecoded ?: throw IllegalArgumentException("Detected a PS Vita-style 8-byte save header, but Vita RLE decompression failed: ${failures.joinToString("; ")}")
         }
         if (data.size >= 3) {
             val header = String(data, 0, 3, Charsets.US_ASCII)
@@ -226,7 +194,7 @@ class MainActivity : Activity() {
                 throw IllegalArgumentException("This looks like an Xbox 360 CON/PIRS container. Decrypt/decompress it before using this extractor.")
             }
         }
-        val endians = when (mode) { 1 -> listOf("big"); 2 -> listOf("little"); else -> listOf("big", "little") }
+        val endians = when (mode) { 1 -> listOf("big"); 2 -> listOf("little"); 3 -> listOf("little", "big"); else -> listOf("big", "little") }
         if (data.size < 8) throw IllegalArgumentException("File is too small to contain the 8-byte save header.")
         var chosenEndian: String? = null
         var indexOffset = -1L
@@ -245,7 +213,8 @@ class MainActivity : Activity() {
             val preview = data.take(16).joinToString(" ") { "%02X".format(it) }
             val bigOffset = u32(data, 0, "big")
             val littleOffset = u32(data, 0, "little")
-            throw IllegalArgumentException("Header did not contain a plausible index offset. Size: ${data.size} bytes; first 16 bytes: $preview; big-endian offset: $bigOffset; little-endian offset: $littleOffset. This may be the wrong save file, a container, or an unsupported edition/version.")
+            val vitaHint = if (mode == 3) " Vita RLE was decoded from byte 8 onward, matching the Minecraft Vita source. This app does not decrypt the separate PS Vita PFS/PSVIMG save-container layer; if this GAMEDATA.bin is still encrypted, its index will remain unreadable here." else ""
+            throw IllegalArgumentException("Header did not contain a plausible index offset. Size: ${data.size} bytes; first 16 bytes: $preview; big-endian offset: $bigOffset; little-endian offset: $littleOffset. This may be the wrong save file, a container, or an unsupported edition/version.$vitaHint")
         }
         val result = ArrayList<ExtractedFile>()
         var cursor = indexOffset.toInt()
@@ -268,6 +237,34 @@ class MainActivity : Activity() {
         }
         if (result.isEmpty()) throw IllegalArgumentException("Index offset $indexOffset ($endian-endian) was plausible, but no named files were extracted. Header file-count field: $headerFileCount; 144-byte records scanned: $recordsRead.")
         return result
+    }
+
+    private fun decodeVitaPayload(input: ByteArray): ByteArray {
+        val output = ByteArrayOutputStream(input.size)
+        output.write(input, 0, 8)
+        var cursor = 8
+        val maxOutput = 536870912L
+        while (cursor < input.size) {
+            val value = input[cursor].toInt() and 0xff
+            cursor++
+            if (value != 0) {
+                output.write(value)
+            } else {
+                if (cursor >= input.size) {
+                    throw IllegalArgumentException("Vita RLE stream ends immediately after a zero marker.")
+                }
+                val zeroCount = input[cursor].toInt() and 0xff
+                cursor++
+                if (output.size().toLong() + zeroCount > maxOutput) {
+                    throw IllegalArgumentException("Vita RLE output exceeds the 512 MiB safety limit.")
+                }
+                repeat(zeroCount) { output.write(0) }
+            }
+            if (output.size().toLong() > maxOutput) {
+                throw IllegalArgumentException("Vita RLE output exceeds the 512 MiB safety limit.")
+            }
+        }
+        return output.toByteArray()
     }
 
     private fun u32(bytes: ByteArray, at: Int, endian: String): Long {
