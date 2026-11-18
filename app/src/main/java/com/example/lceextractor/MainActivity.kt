@@ -104,6 +104,7 @@ class MainActivity : Activity() {
             setBackgroundColor(0xFFF1F4F7.toInt())
             minHeight = dp(120)
             gravity = Gravity.TOP
+            setTextIsSelectable(true)
         }
         content.addView(status, fullWidth())
 
